@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>malcolmston/puppeteer — Puppeteer-style page automation for Go</title>
+<meta name="description" content="A from-scratch, standard-library-only Go toolkit inspired by the Node.js Puppeteer API: Launch/Browser/Page over net/http with a cookie jar, an own HTML tokenizer and DOM builder, a real CSS selector engine (QuerySelector/QuerySelectorAll incl. :nth-child(An+B)), element traversal, resolved Links and form discovery/FillForm/Submit. No JavaScript execution, no rendering.">
+<script>
+  // Apply the shared light/dark choice before first paint to avoid a flash.
+  try { document.documentElement.setAttribute('data-theme', localStorage.getItem('mgo-theme') || 'dark'); } catch (e) {}
+</script>
+<script src="https://kit.fontawesome.com/00bdba4c90.js" crossorigin="anonymous"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="module" src="/src/main.tsx"></script>
+</body>
+</html>
