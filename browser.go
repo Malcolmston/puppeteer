@@ -170,6 +170,14 @@ type Page struct {
 	doc  *Node
 	body []byte
 	resp *Response
+
+	// history holds the absolute URLs successfully navigated to, in visit
+	// order; histIdx points at the current entry. histLock suppresses history
+	// recording while GoBack, GoForward and Reload re-navigate. These back the
+	// session-history helpers in navigation.go.
+	history  []string
+	histIdx  int
+	histLock bool
 }
 
 // SetExtraHTTPHeaders sets page-level headers that augment the browser's.
@@ -255,6 +263,13 @@ func (p *Page) do(req *http.Request) (*Response, error) {
 	p.url = final
 	p.body = body
 	p.doc = Parse(string(body))
+	if !p.histLock {
+		if p.histIdx < len(p.history)-1 {
+			p.history = p.history[:p.histIdx+1]
+		}
+		p.history = append(p.history, final.String())
+		p.histIdx = len(p.history) - 1
+	}
 	r := &Response{
 		URL:        final,
 		Status:     resp.Status,
