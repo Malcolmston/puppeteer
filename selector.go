@@ -28,18 +28,22 @@ type compoundSelector struct {
 }
 
 // attrSelector matches on an attribute. op is one of "", "=", "^=", "$=", "*=",
-// "~=", "|=".
+// "~=", "|=". ci reports whether the optional case-insensitive flag ("i") was
+// present, in which case the value comparison ignores ASCII case.
 type attrSelector struct {
 	name string
 	op   string
 	val  string
+	ci   bool
 }
 
 // pseudoSelector matches structural pseudo-classes. For nth-child style
-// pseudos, the pattern is a*n + b (1-based).
+// pseudos, the pattern is a*n + b (1-based). sub is non-nil only for the
+// functional :not() pseudo-class, holding its compiled argument selector list.
 type pseudoSelector struct {
 	name string
 	a, b int
+	sub  *selector
 }
 
 // compileSelector parses a selector string into a reusable compiled selector.
@@ -191,6 +195,12 @@ func (p *selParser) parseAttr() (attrSelector, error) {
 	p.skipSpace()
 	a.val = p.readAttrValue()
 	p.skipSpace()
+	// Optional case-sensitivity flag: [attr=val i] or [attr=val s].
+	if p.pos < len(p.src) && (p.src[p.pos] == 'i' || p.src[p.pos] == 'I' || p.src[p.pos] == 's' || p.src[p.pos] == 'S') {
+		a.ci = p.src[p.pos] == 'i' || p.src[p.pos] == 'I'
+		p.pos++
+		p.skipSpace()
+	}
 	if p.pos >= len(p.src) || p.src[p.pos] != ']' {
 		return a, fmt.Errorf("puppeteer: unterminated attribute selector in %q", p.src)
 	}
@@ -230,31 +240,62 @@ func (p *selParser) parsePseudo() (pseudoSelector, error) {
 	case "first-child":
 		ps.a, ps.b = 0, 1
 		ps.name = "nth-child"
-	case "last-child":
-		ps.name = "last-child"
-	case "nth-child":
-		if p.pos >= len(p.src) || p.src[p.pos] != '(' {
-			return ps, fmt.Errorf("puppeteer: :nth-child requires an argument in %q", p.src)
+	case "first-of-type":
+		ps.a, ps.b = 0, 1
+		ps.name = "nth-of-type"
+	case "last-child", "last-of-type", "only-child", "only-of-type", "empty", "root":
+		// Structural pseudo-classes that take no argument.
+	case "nth-child", "nth-last-child", "nth-of-type", "nth-last-of-type":
+		arg, err := p.readParenArg(name)
+		if err != nil {
+			return ps, err
 		}
-		p.pos++ // '('
-		start := p.pos
-		for p.pos < len(p.src) && p.src[p.pos] != ')' {
-			p.pos++
-		}
-		arg := strings.TrimSpace(p.src[start:p.pos])
-		if p.pos >= len(p.src) {
-			return ps, fmt.Errorf("puppeteer: unterminated :nth-child in %q", p.src)
-		}
-		p.pos++ // ')'
 		a, b, err := parseNth(arg)
 		if err != nil {
 			return ps, err
 		}
 		ps.a, ps.b = a, b
+	case "not":
+		arg, err := p.readParenArg(name)
+		if err != nil {
+			return ps, err
+		}
+		sub, err := compileSelector(arg)
+		if err != nil {
+			return ps, fmt.Errorf("puppeteer: invalid :not() argument: %w", err)
+		}
+		ps.sub = sub
 	default:
 		return ps, fmt.Errorf("puppeteer: unsupported pseudo-class :%s", name)
 	}
 	return ps, nil
+}
+
+// readParenArg consumes a parenthesized functional-pseudo argument, honoring
+// balanced nested parentheses (as in :not(:nth-child(2))), and returns the
+// trimmed inner text. name is used only for error messages.
+func (p *selParser) readParenArg(name string) (string, error) {
+	if p.pos >= len(p.src) || p.src[p.pos] != '(' {
+		return "", fmt.Errorf("puppeteer: :%s requires an argument in %q", name, p.src)
+	}
+	p.pos++ // '('
+	start := p.pos
+	depth := 1
+	for p.pos < len(p.src) && depth > 0 {
+		switch p.src[p.pos] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				arg := strings.TrimSpace(p.src[start:p.pos])
+				p.pos++ // ')'
+				return arg, nil
+			}
+		}
+		p.pos++
+	}
+	return "", fmt.Errorf("puppeteer: unterminated :%s in %q", name, p.src)
 }
 
 // parseNth parses an An+B microsyntax value (e.g. "odd", "2n+1", "-n+3", "4").
@@ -423,29 +464,34 @@ func matchAttr(a attrSelector, n *Node) bool {
 	if !ok {
 		return false
 	}
+	val := a.val
+	if a.ci {
+		v = strings.ToLower(v)
+		val = strings.ToLower(val)
+	}
 	switch a.op {
 	case "":
 		return true
 	case "=":
-		return v == a.val
+		return v == val
 	case "^=":
-		return a.val != "" && strings.HasPrefix(v, a.val)
+		return val != "" && strings.HasPrefix(v, val)
 	case "$=":
-		return a.val != "" && strings.HasSuffix(v, a.val)
+		return val != "" && strings.HasSuffix(v, val)
 	case "*=":
-		return a.val != "" && strings.Contains(v, a.val)
+		return val != "" && strings.Contains(v, val)
 	case "~=":
-		if a.val == "" {
+		if val == "" {
 			return false
 		}
 		for _, f := range strings.Fields(v) {
-			if f == a.val {
+			if f == val {
 				return true
 			}
 		}
 		return false
 	case "|=":
-		return v == a.val || strings.HasPrefix(v, a.val+"-")
+		return v == val || strings.HasPrefix(v, val+"-")
 	}
 	return false
 }
@@ -453,25 +499,107 @@ func matchAttr(a attrSelector, n *Node) bool {
 func matchPseudo(ps pseudoSelector, n *Node) bool {
 	switch ps.name {
 	case "nth-child":
-		idx := elementIndex(n) // 1-based
+		idx := elementIndex(n, false, "")
+		if idx == 0 {
+			return false
+		}
+		return nthMatch(ps.a, ps.b, idx)
+	case "nth-last-child":
+		idx := elementIndex(n, true, "")
+		if idx == 0 {
+			return false
+		}
+		return nthMatch(ps.a, ps.b, idx)
+	case "nth-of-type":
+		idx := elementIndex(n, false, n.Data)
+		if idx == 0 {
+			return false
+		}
+		return nthMatch(ps.a, ps.b, idx)
+	case "nth-last-of-type":
+		idx := elementIndex(n, true, n.Data)
 		if idx == 0 {
 			return false
 		}
 		return nthMatch(ps.a, ps.b, idx)
 	case "last-child":
-		return nextElement(n) == nil && n.Parent != nil
+		return n.Parent != nil && nextElement(n) == nil
+	case "last-of-type":
+		return n.Parent != nil && nextElementOfType(n) == nil
+	case "only-child":
+		return n.Parent != nil && prevElement(n) == nil && nextElement(n) == nil
+	case "only-of-type":
+		return n.Parent != nil && prevElementOfType(n) == nil && nextElementOfType(n) == nil
+	case "empty":
+		return isEmptyNode(n)
+	case "root":
+		return n.Parent != nil && n.Parent.Type != ElementNode
+	case "not":
+		return ps.sub != nil && !ps.sub.matchNode(n)
 	}
 	return false
 }
 
-// elementIndex returns the 1-based position of n among its element siblings.
-func elementIndex(n *Node) int {
+// isEmptyNode reports whether n has no element children and no text other than
+// whitespace, matching the CSS :empty pseudo-class.
+func isEmptyNode(n *Node) bool {
+	for _, c := range n.Children {
+		switch c.Type {
+		case ElementNode:
+			return false
+		case TextNode:
+			if strings.TrimSpace(c.Data) != "" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// nextElementOfType returns the following sibling element sharing n's tag name.
+func nextElementOfType(n *Node) *Node {
+	for s := nextElement(n); s != nil; s = nextElement(s) {
+		if s.Data == n.Data {
+			return s
+		}
+	}
+	return nil
+}
+
+// prevElementOfType returns the preceding sibling element sharing n's tag name.
+func prevElementOfType(n *Node) *Node {
+	for s := prevElement(n); s != nil; s = prevElement(s) {
+		if s.Data == n.Data {
+			return s
+		}
+	}
+	return nil
+}
+
+// elementIndex returns the 1-based position of n among its element siblings. If
+// fromEnd is true the count runs from the last sibling backward. If tag is
+// non-empty only siblings with that tag name are counted (for :nth-of-type).
+func elementIndex(n *Node, fromEnd bool, tag string) int {
 	if n.Parent == nil {
 		return 0
 	}
+	sibs := n.Parent.Children
 	i := 0
-	for _, s := range n.Parent.Children {
-		if s.Type != ElementNode {
+	if fromEnd {
+		for j := len(sibs) - 1; j >= 0; j-- {
+			s := sibs[j]
+			if s.Type != ElementNode || (tag != "" && s.Data != tag) {
+				continue
+			}
+			i++
+			if s == n {
+				return i
+			}
+		}
+		return 0
+	}
+	for _, s := range sibs {
+		if s.Type != ElementNode || (tag != "" && s.Data != tag) {
 			continue
 		}
 		i++

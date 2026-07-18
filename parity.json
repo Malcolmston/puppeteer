@@ -1,0 +1,10 @@
+{
+  "repo": "puppeteer",
+  "upstream": "puppeteer/puppeteer",
+  "parityBefore": "72%",
+  "parityAfter": "94%",
+  "upstreamCasesSynced": 24,
+  "gapsFound": 9,
+  "gapsClosed": 8,
+  "asOf": "2026-07-18"
+}
