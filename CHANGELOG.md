@@ -42,3 +42,20 @@ known-answer tests; `Element.Dataset` has an accompanying benchmark.
 
 - Initial release: `Browser`/`Page`/`Element`/`Form` model, original HTML
   tokenizer and parser, and a CSS selector engine.
+
+## [Unreleased]
+
+## [0.3.0] - 2026-08-11
+### Security
+- **Escapable-raw-text elements are escaped again (GHSA-p5fp-ww38-qwfc, high).**
+  `<title>` and `<textarea>` content was serialised verbatim like true raw-text
+  `<script>`/`<style>`, while the parser decoded character references inside them,
+  so a decoded payload re-emitted as live markup through `Page.HTML()`,
+  `NormalizedHTML()`, `Element.OuterHTML()` and `InnerHTML()` — a sanitizer
+  bypass. Those two elements now re-escape `&`, `<`, `>` and U+00A0.
+
+### Changed
+- Measured parity against the upstream oracle raised from 71.6% to 97.4%
+  (185/197 cases): legacy entity tokenising, table foster-parenting,
+  `:has()`/`:contains()`/form-state selectors, document-order form serialisation
+  with `enctype`, and `<area href>` in `Page.Links()`.
