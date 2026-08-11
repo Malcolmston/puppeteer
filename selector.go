@@ -9,6 +9,9 @@ import (
 // selector is a compiled CSS selector list (comma-separated groups).
 type selector struct {
 	groups []complexSelector
+	// firstOnly is set when the jQuery positional :first pseudo-class appears;
+	// queryAll then keeps only the first element of the result set.
+	firstOnly bool
 }
 
 // complexSelector is a chain of compound selectors joined by combinators. parts
@@ -44,12 +47,29 @@ type pseudoSelector struct {
 	name string
 	a, b int
 	sub  *selector
+	// comb is the leading combinator of a :has() argument (' ', '>', '+', '~').
+	comb byte
+	// text is the literal argument of the :contains() jQuery extension.
+	text string
 }
 
 // compileSelector parses a selector string into a reusable compiled selector.
 func compileSelector(s string) (*selector, error) {
 	p := &selParser{src: s}
-	return p.parseSelectorList()
+	sel, err := p.parseSelectorList()
+	if err != nil {
+		return nil, err
+	}
+	for _, g := range sel.groups {
+		for _, part := range g.parts {
+			for _, ps := range part.pseudos {
+				if ps.name == "first" {
+					sel.firstOnly = true
+				}
+			}
+		}
+	}
+	return sel, nil
 }
 
 type selParser struct {
@@ -243,8 +263,39 @@ func (p *selParser) parsePseudo() (pseudoSelector, error) {
 	case "first-of-type":
 		ps.a, ps.b = 0, 1
 		ps.name = "nth-of-type"
-	case "last-child", "last-of-type", "only-child", "only-of-type", "empty", "root":
-		// Structural pseudo-classes that take no argument.
+	case "last-child", "last-of-type", "only-child", "only-of-type", "empty", "root",
+		"checked", "disabled", "enabled", "selected", "required", "optional", "read-only", "read-write":
+		// Structural / form-state pseudo-classes that take no argument.
+	case "first":
+		// jQuery positional pseudo-class: matches the first element of the
+		// result set. Handled at query time; here it always matches.
+	case "has":
+		arg, err := p.readParenArg(name)
+		if err != nil {
+			return ps, err
+		}
+		comb := byte(' ')
+		inner := strings.TrimSpace(arg)
+		if len(inner) > 0 && (inner[0] == '>' || inner[0] == '+' || inner[0] == '~') {
+			comb = inner[0]
+			inner = strings.TrimSpace(inner[1:])
+		}
+		sub, err := compileSelector(inner)
+		if err != nil {
+			return ps, fmt.Errorf("puppeteer: invalid :has() argument: %w", err)
+		}
+		ps.sub = sub
+		ps.comb = comb
+	case "contains":
+		arg, err := p.readParenArg(name)
+		if err != nil {
+			return ps, err
+		}
+		arg = strings.TrimSpace(arg)
+		if len(arg) >= 2 && (arg[0] == '"' || arg[0] == '\'') && arg[len(arg)-1] == arg[0] {
+			arg = arg[1 : len(arg)-1]
+		}
+		ps.text = arg
 	case "nth-child", "nth-last-child", "nth-of-type", "nth-last-of-type":
 		arg, err := p.readParenArg(name)
 		if err != nil {
@@ -536,19 +587,123 @@ func matchPseudo(ps pseudoSelector, n *Node) bool {
 		return n.Parent != nil && n.Parent.Type != ElementNode
 	case "not":
 		return ps.sub != nil && !ps.sub.matchNode(n)
+	case "first":
+		// Positional; the per-node test always passes and queryAll truncates.
+		return true
+	case "checked":
+		return isChecked(n)
+	case "selected":
+		return n.Data == "option" && hasAttr(n, "selected")
+	case "disabled":
+		return isFormControl(n) && hasAttr(n, "disabled")
+	case "enabled":
+		return isFormControl(n) && !hasAttr(n, "disabled")
+	case "required":
+		return isFormControl(n) && hasAttr(n, "required")
+	case "optional":
+		return isFormControl(n) && !hasAttr(n, "required")
+	case "read-only":
+		return isTextControl(n) && (hasAttr(n, "readonly") || hasAttr(n, "disabled"))
+	case "read-write":
+		return isTextControl(n) && !hasAttr(n, "readonly") && !hasAttr(n, "disabled")
+	case "has":
+		return matchHas(ps, n)
+	case "contains":
+		var sb strings.Builder
+		n.text(&sb)
+		return strings.Contains(sb.String(), ps.text)
 	}
 	return false
 }
 
-// isEmptyNode reports whether n has no element children and no text other than
-// whitespace, matching the CSS :empty pseudo-class.
+// hasAttr reports whether n carries the named attribute (any value).
+func hasAttr(n *Node, name string) bool {
+	_, ok := n.attr(name)
+	return ok
+}
+
+// formControls is the set of elements the :enabled/:disabled pseudo-classes
+// (and friends) apply to.
+var formControls = map[string]bool{
+	"input": true, "button": true, "select": true, "textarea": true,
+	"option": true, "optgroup": true, "fieldset": true,
+}
+
+func isFormControl(n *Node) bool { return formControls[n.Data] }
+
+// isTextControl reports whether n is a control that can be :read-only/:read-write.
+func isTextControl(n *Node) bool { return n.Data == "input" || n.Data == "textarea" }
+
+// isChecked reports whether n matches :checked — a checked checkbox/radio, or a
+// selected <option>.
+func isChecked(n *Node) bool {
+	switch n.Data {
+	case "input":
+		typ := strings.ToLower(attrOrDefault(n, "type", "text"))
+		if typ == "checkbox" || typ == "radio" {
+			return hasAttr(n, "checked")
+		}
+		return false
+	case "option":
+		return hasAttr(n, "selected")
+	}
+	return false
+}
+
+// attrOrDefault returns the value of the named attribute or def when absent.
+func attrOrDefault(n *Node, name, def string) string {
+	if v, ok := n.attr(name); ok {
+		return v
+	}
+	return def
+}
+
+// matchHas implements the :has() relative-selector pseudo-class.
+func matchHas(ps pseudoSelector, n *Node) bool {
+	if ps.sub == nil {
+		return false
+	}
+	if ps.comb == '>' {
+		for _, c := range n.Children {
+			if c.Type == ElementNode && ps.sub.matchNode(c) {
+				return true
+			}
+		}
+		return false
+	}
+	// Descendant combinator (the default): any descendant may match.
+	found := false
+	var walk func(m *Node)
+	walk = func(m *Node) {
+		for _, c := range m.Children {
+			if c.Type != ElementNode {
+				continue
+			}
+			if ps.sub.matchNode(c) {
+				found = true
+				return
+			}
+			walk(c)
+			if found {
+				return
+			}
+		}
+	}
+	walk(n)
+	return found
+}
+
+// isEmptyNode reports whether n matches the CSS :empty pseudo-class as css-select
+// implements it: an element is :empty only when it has no child elements and no
+// character data at all — even whitespace-only text (and comments) make it
+// non-empty (the CSS 2 / Selectors 3 rule, not the Selectors 4 relaxation).
 func isEmptyNode(n *Node) bool {
 	for _, c := range n.Children {
 		switch c.Type {
-		case ElementNode:
+		case ElementNode, CommentNode:
 			return false
 		case TextNode:
-			if strings.TrimSpace(c.Data) != "" {
+			if c.Data != "" {
 				return false
 			}
 		}
@@ -640,6 +795,9 @@ func (s *selector) queryAll(root *Node) []*Node {
 		}
 	}
 	walk(root)
+	if s.firstOnly && len(out) > 1 {
+		out = out[:1]
+	}
 	return out
 }
 

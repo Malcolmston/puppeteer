@@ -136,7 +136,18 @@ func (t *tokenizer) readTag() (token, bool) {
 			continue
 		}
 		if tok.kind == tokStartTag {
-			tok.attr = append(tok.attr, a)
+			// Duplicate attributes: the first occurrence wins (HTML tree
+			// construction discards later duplicates on the same element).
+			dup := false
+			for _, existing := range tok.attr {
+				if existing.Name == a.Name {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				tok.attr = append(tok.attr, a)
+			}
 		}
 	}
 	return tok, true
@@ -181,7 +192,7 @@ func (t *tokenizer) readAttribute() (Attribute, bool) {
 		}
 		val = t.src[vs:t.pos]
 	}
-	return Attribute{Name: name, Value: decodeEntities(val)}, true
+	return Attribute{Name: name, Value: decodeEntitiesCtx(val, true)}, true
 }
 
 func (t *tokenizer) readComment() token {
@@ -200,6 +211,12 @@ func (t *tokenizer) readComment() token {
 
 func (t *tokenizer) readBogusComment() token {
 	t.pos++ // consume '<'
+	// A bogus comment introduced by "<!" (an unknown declaration such as
+	// <![CDATA[…]]> or <!bogus>) drops the leading '!' from the comment data,
+	// matching the HTML tokenizer. A "<?" processing instruction keeps its '?'.
+	if t.pos < len(t.src) && t.src[t.pos] == '!' {
+		t.pos++
+	}
 	end := strings.IndexByte(t.src[t.pos:], '>')
 	var body string
 	if end < 0 {
@@ -266,8 +283,21 @@ func isAttrNameChar(c byte) bool {
 	return !isSpace(c) && c != '=' && c != '>' && c != '/' && c != '<' && c != '"' && c != '\''
 }
 
-// decodeEntities replaces HTML character references with their runes.
-func decodeEntities(s string) string {
+// decodeEntities replaces HTML character references in text content (the
+// non-attribute context) with their runes.
+func decodeEntities(s string) string { return decodeEntitiesCtx(s, false) }
+
+// isAlnum reports whether c is an ASCII letter or digit.
+func isAlnum(c byte) bool {
+	return isASCIILetter(c) || (c >= '0' && c <= '9')
+}
+
+// decodeEntitiesCtx decodes HTML character references. When inAttr is true the
+// attribute-value rules apply: a named reference that is not terminated by ';'
+// is left untouched when the character immediately following the match is '='
+// or alphanumeric ("ambiguous ampersand"). In text content a legacy named
+// reference is decoded even without a trailing ';', matching the HTML tokenizer.
+func decodeEntitiesCtx(s string, inAttr bool) string {
 	if !strings.ContainsRune(s, '&') {
 		return s
 	}
@@ -279,26 +309,61 @@ func decodeEntities(s string) string {
 			i++
 			continue
 		}
-		// Find the terminating ';' within a reasonable window.
-		semi := -1
-		for j := i + 1; j < len(s) && j < i+32; j++ {
-			if s[j] == ';' {
-				semi = j
-				break
+		// Numeric character reference: &#123; or &#xAB;.
+		if i+1 < len(s) && s[i+1] == '#' {
+			if r, n, ok := decodeNumericRef(s[i:]); ok {
+				sb.WriteString(r)
+				i += n
+				continue
 			}
-			if !isNameChar(s[j]) && s[j] != '#' {
-				break
-			}
-		}
-		if semi < 0 {
 			sb.WriteByte('&')
 			i++
 			continue
 		}
-		ref := s[i+1 : semi]
-		if decoded, ok := decodeRef(ref); ok {
-			sb.WriteString(decoded)
-			i = semi + 1
+		// Named reference: read the maximal run of alphanumerics.
+		j := i + 1
+		for j < len(s) && isAlnum(s[j]) {
+			j++
+		}
+		name := s[i+1 : j]
+		if name == "" {
+			sb.WriteByte('&')
+			i++
+			continue
+		}
+		hasSemi := j < len(s) && s[j] == ';'
+		// A fully matched, semicolon-terminated named reference always decodes.
+		if hasSemi {
+			if v, ok := namedEntities[name]; ok {
+				sb.WriteString(v)
+				i = j + 1
+				continue
+			}
+		}
+		// Otherwise fall back to the longest legacy-entity prefix, which may be
+		// decoded without a trailing ';'.
+		matched := false
+		for l := len(name); l >= 1; l-- {
+			v, ok := legacyEntities[name[:l]]
+			if !ok {
+				continue
+			}
+			follow := byte(0)
+			if i+1+l < len(s) {
+				follow = s[i+1+l]
+			}
+			// In an attribute value an unterminated named reference is an
+			// "ambiguous ampersand" and is not expanded when followed by '='
+			// or an alphanumeric character.
+			if inAttr && (follow == '=' || isAlnum(follow)) {
+				break
+			}
+			sb.WriteString(v)
+			i = i + 1 + l
+			matched = true
+			break
+		}
+		if matched {
 			continue
 		}
 		sb.WriteByte('&')
@@ -307,27 +372,59 @@ func decodeEntities(s string) string {
 	return sb.String()
 }
 
-func decodeRef(ref string) (string, bool) {
-	if ref == "" {
-		return "", false
+// decodeNumericRef decodes a numeric character reference at the start of s
+// (which begins with "&#"). It returns the decoded string, the number of bytes
+// consumed (including an optional trailing ';'), and whether it succeeded.
+func decodeNumericRef(s string) (string, int, bool) {
+	j := 2 // past "&#"
+	hex := false
+	if j < len(s) && (s[j] == 'x' || s[j] == 'X') {
+		hex = true
+		j++
 	}
-	if ref[0] == '#' {
-		var n int64
-		var err error
-		if len(ref) > 1 && (ref[1] == 'x' || ref[1] == 'X') {
-			n, err = strconv.ParseInt(ref[2:], 16, 32)
-		} else {
-			n, err = strconv.ParseInt(ref[1:], 10, 32)
+	start := j
+	for j < len(s) {
+		c := s[j]
+		if hex {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				break
+			}
+		} else if c < '0' || c > '9' {
+			break
 		}
-		if err != nil || n < 0 {
-			return "", false
-		}
-		return string(rune(n)), true
+		j++
 	}
-	if v, ok := namedEntities[ref]; ok {
-		return v, true
+	if j == start {
+		return "", 0, false
 	}
-	return "", false
+	base := 10
+	if hex {
+		base = 16
+	}
+	n, err := strconv.ParseInt(s[start:j], base, 32)
+	if err != nil || n < 0 {
+		return "", 0, false
+	}
+	if j < len(s) && s[j] == ';' {
+		j++
+	}
+	return string(rune(n)), j, true
+}
+
+// legacyEntities is the subset of named references that the HTML tokenizer
+// decodes even when they are not terminated by a ';' (the "legacy" entities).
+// The longest matching prefix wins, so "&notanentity;" decodes as "¬" +
+// "anentity;". Only entities that actually appear in this decode path are
+// listed; extend as needed.
+var legacyEntities = map[string]string{
+	"amp":  "&",
+	"lt":   "<",
+	"gt":   ">",
+	"quot": "\"",
+	"nbsp": "\u00A0",
+	"copy": "©",
+	"reg":  "®",
+	"not":  "¬",
 }
 
 // namedEntities is a compact table of the most common named references.
@@ -337,7 +434,7 @@ var namedEntities = map[string]string{
 	"gt":     ">",
 	"quot":   "\"",
 	"apos":   "'",
-	"nbsp":   " ",
+	"nbsp":   "\u00A0",
 	"copy":   "©",
 	"reg":    "®",
 	"trade":  "™",

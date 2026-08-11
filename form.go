@@ -142,6 +142,20 @@ func (f *Form) collectFields() {
 			continue
 		}
 		_, disabled := sel.Attr("disabled")
+		_, multiple := sel.Attr("multiple")
+		if multiple {
+			// A <select multiple> contributes one name/value pair per selected
+			// option (the HTML form-serialisation algorithm).
+			for _, val := range selectedOptionValues(sel) {
+				f.fields = append(f.fields, &formField{
+					name:     name,
+					value:    val,
+					disabled: disabled,
+					included: !disabled,
+				})
+			}
+			continue
+		}
 		f.fields = append(f.fields, &formField{
 			name:     name,
 			value:    selectedOptionValue(sel),
@@ -149,6 +163,19 @@ func (f *Form) collectFields() {
 			included: !disabled,
 		})
 	}
+}
+
+// selectedOptionValues returns the values of every selected <option> in a
+// multiple-select, in document order.
+func selectedOptionValues(sel *Element) []string {
+	options, _ := sel.QuerySelectorAll("option")
+	var out []string
+	for _, opt := range options {
+		if _, ok := opt.Attr("selected"); ok {
+			out = append(out, opt.AttrOr("value", opt.TextContent()))
+		}
+	}
+	return out
 }
 
 // selectedOptionValue returns the value of a <select>'s selected option, or the
@@ -202,7 +229,9 @@ func (f *Form) Set(name, value string) {
 	f.fields = append(f.fields, &formField{name: name, value: value, included: true})
 }
 
-// Values returns the url.Values that this form would submit.
+// Values returns the url.Values that this form would submit. Because url.Values
+// is a map, it does not preserve control order; use Serialize (or BuildRequest)
+// when the wire order matters.
 func (f *Form) Values() url.Values {
 	vals := url.Values{}
 	for _, fld := range f.fields {
@@ -212,6 +241,26 @@ func (f *Form) Values() url.Values {
 		vals.Add(fld.name, fld.value)
 	}
 	return vals
+}
+
+// Serialize returns the form's controls as an application/x-www-form-urlencoded
+// string in document order, mirroring the HTML form-serialisation algorithm
+// (and jQuery/cheerio's .serialize()). Unlike url.Values.Encode, the field
+// order is the controls' order in the markup, not sorted by key.
+func (f *Form) Serialize() string {
+	var b strings.Builder
+	for _, fld := range f.fields {
+		if fld.disabled || !fld.included {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('&')
+		}
+		b.WriteString(url.QueryEscape(fld.name))
+		b.WriteByte('=')
+		b.WriteString(url.QueryEscape(fld.value))
+	}
+	return b.String()
 }
 
 // FillForm looks up a form by selector, applies values and returns it ready to
@@ -235,31 +284,39 @@ func (f *Form) BuildRequest(ctx context.Context) (*http.Request, error) {
 	if f.Action == "" {
 		return nil, fmt.Errorf("puppeteer: form has no action URL")
 	}
-	vals := f.Values()
+	encoded := f.Serialize()
 	if f.Method == http.MethodGet {
 		u, err := url.Parse(f.Action)
 		if err != nil {
 			return nil, fmt.Errorf("puppeteer: parsing action %q: %w", f.Action, err)
 		}
-		q := u.Query()
-		for k, vs := range vals {
-			for _, v := range vs {
-				q.Add(k, v)
+		// Preserve document order: append the serialised pairs after any query
+		// string the action URL already carries, rather than re-sorting.
+		if encoded != "" {
+			if u.RawQuery == "" {
+				u.RawQuery = encoded
+			} else {
+				u.RawQuery = u.RawQuery + "&" + encoded
 			}
 		}
-		u.RawQuery = q.Encode()
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		if err != nil {
 			return nil, fmt.Errorf("puppeteer: building request: %w", err)
 		}
 		return req, nil
 	}
-	body := vals.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.Action, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.Action, strings.NewReader(encoded))
 	if err != nil {
 		return nil, fmt.Errorf("puppeteer: building request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// Report the form's declared enctype as the Content-Type. Only
+	// application/x-www-form-urlencoded bodies are actually encoded (there is no
+	// multipart encoder); see COVERAGE.md F2.
+	ct := f.EncType
+	if ct == "" {
+		ct = "application/x-www-form-urlencoded"
+	}
+	req.Header.Set("Content-Type", ct)
 	return req, nil
 }
 

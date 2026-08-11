@@ -341,10 +341,11 @@ func (p *Page) QuerySelectorAll(selector string) ([]*Element, error) {
 	return wrapElements(sel.queryAll(p.doc)), nil
 }
 
-// Links returns every href on the page resolved to an absolute URL. Duplicates
-// are removed while preserving first-seen order.
+// Links returns every href on the page resolved to an absolute URL. Both
+// <a href> and <area href> participate, mirroring document.links. Duplicates
+// are removed while preserving first-seen (document) order.
 func (p *Page) Links() []string {
-	els, _ := p.QuerySelectorAll("a[href]")
+	els, _ := p.QuerySelectorAll("a[href], area[href]")
 	seen := map[string]bool{}
 	var out []string
 	for _, e := range els {

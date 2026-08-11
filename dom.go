@@ -106,8 +106,13 @@ func (n *Node) render(sb *strings.Builder) {
 			c.render(sb)
 		}
 	case TextNode:
-		if p := n.Parent; p != nil && p.Type == ElementNode &&
-			(rawTextElements[p.Data] || escapableRawText[p.Data]) {
+		// Only true raw-text elements (script/style) are serialised verbatim;
+		// their content is CDATA-like and re-tokenised literally. The "escapable
+		// raw text" elements (title/textarea) are RCDATA: the parser decodes
+		// character references inside them, so the serialiser MUST re-escape on
+		// the way out, exactly like ordinary text. Writing them verbatim was a
+		// sanitizer-bypass bug (GHSA-p5fp-ww38-qwfc); see API-DEVIATIONS.md.
+		if p := n.Parent; p != nil && p.Type == ElementNode && rawTextElements[p.Data] {
 			sb.WriteString(n.Data)
 		} else {
 			sb.WriteString(escapeText(n.Data))
@@ -150,11 +155,24 @@ func (n *Node) renderChildren(sb *strings.Builder) {
 	}
 }
 
-var textEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+// textEscaper mirrors dom-serializer's escapeText: & < > and the non-breaking
+// space U+00A0 are re-escaped; a literal '"' in a text node is left as-is.
+var textEscaper = strings.NewReplacer(
+	"&", "&amp;",
+	"<", "&lt;",
+	">", "&gt;",
+	"\u00A0", "&nbsp;",
+)
 
 func escapeText(s string) string { return textEscaper.Replace(s) }
 
-var attrEscaper = strings.NewReplacer("&", "&amp;", `"`, "&quot;")
+// attrEscaper mirrors dom-serializer's escapeAttribute: & and " (and U+00A0)
+// are escaped inside a double-quoted attribute value; '<' and '>' are not.
+var attrEscaper = strings.NewReplacer(
+	"&", "&amp;",
+	`"`, "&quot;",
+	"\u00A0", "&nbsp;",
+)
 
 func escapeAttr(s string) string { return attrEscaper.Replace(s) }
 
